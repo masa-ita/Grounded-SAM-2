@@ -1,5 +1,4 @@
 import argparse
-import cv2
 import torch
 import numpy as np
 import supervision as sv
@@ -8,38 +7,32 @@ from supervision_utils import CUSTOM_COLOR_MAP
 from PIL import Image
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection 
-import csv
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 import os
 
-# environment settings
-# use bfloat16
+# 環境設定
 torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
 if torch.cuda.get_device_properties(0).major >= 8:
-    # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-# define SAM2ImagePredictor class
-class SAM2Predictor():
+class SAM2Predictor:
     def __init__(self, sam2_checkpoint, model_cfg, device):
         self.sam2_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
         self.sam2_predictor = SAM2ImagePredictor(self.sam2_model)
 
-    
     def set_image(self, image):
         self.sam2_predictor.set_image(np.array(image.convert("RGB")))
 
     def predict(self, input_boxes):
         masks, scores, logits = self.sam2_predictor.predict(
-            point_coords = None,
-            point_labels = None,
-            box = input_boxes,
-            multimask_output = False
+            point_coords=None,
+            point_labels=None,
+            box=input_boxes,
+            multimask_output=False
         )
 
-        # convert the shape to (n, H, W)
         if masks.ndim == 3:
             masks = masks[None]
             scores = scores[None]
@@ -49,7 +42,7 @@ class SAM2Predictor():
 
         return masks, scores, logits
 
-class DINODetector():
+class DINODetector:
     def __init__(self, model_id, device):
         self.device = device
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -69,10 +62,14 @@ class DINODetector():
         )
 
         input_boxes = results[0]["boxes"].cpu().numpy()
-
         return input_boxes
-    
 
+def process_keywords(keywords):
+    return ' '.join([kw if kw.endswith('.') else kw + '.' for kw in keywords])
+
+def get_image_files(images_dir):
+    return [file for file in os.listdir(images_dir) 
+            if file.lower().endswith((".jpg", ".jpeg"))]
 
 def main():
     parser = argparse.ArgumentParser()
@@ -81,52 +78,35 @@ def main():
     parser.add_argument("--keywords", nargs="+", help="Keywords for filtering images", required=True)
     args = parser.parse_args()
 
-    # Access the values using args.images_dir and args.masks_dir
     images_dir = args.images_dir
     masks_dir = args.masks_dir
-    keywords = args.keywords
-    # Check if any keyword is missing a period at the end
-    for i in range(len(keywords)):
-        if not keywords[i].endswith('.'):
-            keywords[i] += '.'
+    keywords = process_keywords(args.keywords)
 
-    # Join the keywords with spaces
-    keywords = ' '.join(keywords)
-    
-    # build SAM2 image predictor
     sam2_checkpoint = "./checkpoints/sam2_hiera_large.pt"
     model_cfg = "sam2_hiera_l.yaml"
-
     mask_predictor = SAM2Predictor(sam2_checkpoint, model_cfg, "cuda")
 
-    # build grounding dino from huggingface
     model_id = "IDEA-Research/grounding-dino-tiny"
+    dino_detector = DINODetector(model_id, "cuda")
 
-    dino_detector= DINODetector(model_id, "cuda")
+    image_files = get_image_files(images_dir)
 
-    # Get the list of JPEG files in the images_dir
-    image_files = [file for file in os.listdir(images_dir) 
-                   if file.endswith(".jpg") or file.endswith(".jpeg") or
-                   file.endswith(".JPG") or file.endswith(".JPEG")]
-
-    # Loop through the image files
     for image_file in image_files:
-        # Load the image
-        image = Image.open(os.path.join(images_dir, image_file))
+        try:
+            image_path = os.path.join(images_dir, image_file)
+            image = Image.open(image_path)
+            mask_predictor.set_image(image)
 
-        mask_predictor.set_image(image)
+            input_boxes = dino_detector.detect_objects(image, keywords)
+            masks, _, _ = mask_predictor.predict(input_boxes)
 
-        # get the box prompt for SAM 2
-        input_boxes = dino_detector.detect_objects(image, keywords)
+            masks = np.sum(masks, axis=0)
+            masks = (masks > 0).astype(np.uint8)
 
-        masks, _, _ = mask_predictor.predict(input_boxes)
+            mask_path = os.path.join(masks_dir, f"{os.path.splitext(image_file)[0]}.png")
+            Image.fromarray(masks * 255).save(mask_path)
+        except Exception as e:
+            print(f"Error processing {image_file}: {e}")
 
-        masks = np.sum(masks, axis=0)
-        masks = (masks > 0).astype(np.uint8)
-        masks = np.repeat([masks * 255], 3, axis=0)
-        masks = masks.transpose(1,2,0)
-
-        cv2.imwrite(os.path.join(masks_dir, image_file), masks)    
-    
 if __name__ == "__main__":
     main()
