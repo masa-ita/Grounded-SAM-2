@@ -100,11 +100,10 @@ def main():
             input_boxes = dino_detector.detect_objects(image, keywords)
             masks, _, _ = mask_predictor.predict(input_boxes)
 
-            masks = np.sum(masks, axis=0)
-            masks = (masks > 0).astype(np.uint8)
+            combined_mask = np.bitwise_or.reduce(masks.astype(np.uint8), axis=0) * 255
 
-            mask_path = os.path.join(masks_dir, f"{os.path.splitext(image_file)[0]}.png")
-            Image.fromarray(masks * 255).save(mask_path)
+            mask_path = os.path.join(masks_dir, f"{os.path.splitext(image_file)[0]}.JPG")
+            Image.fromarray(combined_mask).save(mask_path)
         except Exception as e:
             print(f"Error processing {image_file}: {e}")
 
